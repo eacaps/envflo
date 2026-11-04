@@ -1,0 +1,7 @@
+# dotenv-flow convention: committed defaults live in .env and .env.<env>;
+# secrets live only in the *.local overlays, which must never be committed.
+*.local
+
+# OS / editor cruft
+.DS_Store
+*.swp

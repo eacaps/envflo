@@ -1,0 +1,187 @@
+# envflo — load environment-specific .env files (dotenv-flow convention) into the current shell.
+#
+# Usage:
+#   source envflo <environment>
+#
+# Loads, in order (later files override earlier ones):
+#   .env  ->  .env.local  ->  .env.<environment>  ->  .env.<environment>.local
+#
+# Keys set on a previous `source envflo ...` are unset first, so switching
+# environments (e.g. `source envflo beta` then `source envflo prod`) is clean.
+#
+# Works in both zsh and bash. Must be sourced, not executed.
+
+# This function does all the work. It uses `return` (never `exit`) so it can
+# never kill the shell it is sourced into.
+envflo() {
+    # Declare all locals up front (declaring inside loops can emit typeset
+    # noise under some zsh configurations).
+    local _envflo_env _base_dir _loaded_any _new_keys _file _line _key _val _k
+    local _envs _name _envflo_nullglob
+
+    _envflo_env="$1"
+    _base_dir="${ENVFLO_DIR:-.}"
+
+    # --- no argument: print usage and list available environments ----------
+    if [ -z "$_envflo_env" ]; then
+        printf 'envflo: usage: source envflo <environment>\n' >&2
+
+        # Discover environments from .env.<name> files, skipping the bare
+        # `.env`, the `.env.local` base overlay, and any `.env.<name>.local`
+        # overlay (we only list the primary env name once).
+        #
+        # zsh aborts on a glob with no matches (unlike bash, which leaves the
+        # literal pattern). Enable null-glob for the expansion, portably:
+        #   - zsh:  setopt NULL_GLOB
+        #   - bash: shopt -s nullglob
+        # Save and restore so we don't disturb the caller's shell options.
+        if [ -n "$ZSH_VERSION" ]; then
+            setopt localoptions nullglob 2>/dev/null
+        elif [ -n "$BASH_VERSION" ]; then
+            _envflo_nullglob=$(shopt -p nullglob 2>/dev/null)
+            shopt -s nullglob 2>/dev/null
+        fi
+
+        _envs=""
+        for _file in "$_base_dir"/.env.*; do
+            [ -f "$_file" ] || continue
+            _name="${_file##*/.env.}"        # strip path + ".env." prefix
+            case "$_name" in
+                local) continue ;;            # .env.local -> base overlay
+                *.local) _name="${_name%.local}" ;;  # .env.<x>.local -> <x>
+            esac
+            [ -z "$_name" ] && continue
+            # dedupe (newline-separated)
+            case "
+$_envs
+" in
+                *"
+$_name
+"*) ;;
+                *) _envs="$_envs
+$_name" ;;
+            esac
+        done
+        _envs="${_envs#
+}"
+
+        # restore bash nullglob setting (zsh localoptions auto-restores)
+        if [ -n "$BASH_VERSION" ] && [ -n "$_envflo_nullglob" ]; then
+            eval "$_envflo_nullglob"
+        fi
+
+        if [ -n "$_envs" ]; then
+            printf 'envflo: available environments in %s:\n' "$_base_dir" >&2
+            printf '%s\n' "$_envs" | sort | sed 's/^/  /' >&2
+        else
+            printf 'envflo: no environment files (.env.<name>) found in %s\n' \
+                "$_base_dir" >&2
+        fi
+        return 2
+    fi
+
+    # --- unset keys set by a previous invocation ---------------------------
+    # ENVFLO_KEYS is stored newline-separated so that a `while read` loop can
+    # iterate it identically in bash and zsh (neither reliably word-splits an
+    # unquoted variable the same way, so we avoid splitting on spaces).
+    if [ -n "$ENVFLO_KEYS" ]; then
+        while IFS= read -r _k; do
+            [ -n "$_k" ] && unset "$_k"
+        done <<EOF
+$ENVFLO_KEYS
+EOF
+        unset ENVFLO_KEYS
+    fi
+
+    # --- build the ordered list of candidate files -------------------------
+    _loaded_any=0
+    _new_keys=""
+
+    # Iterate explicit positional args rather than a split string, for zsh
+    # compatibility (zsh does not word-split unquoted variables).
+    set -- \
+        "$_base_dir/.env" \
+        "$_base_dir/.env.local" \
+        "$_base_dir/.env.$_envflo_env" \
+        "$_base_dir/.env.$_envflo_env.local"
+
+    for _file in "$@"; do
+        [ -f "$_file" ] || continue
+        _loaded_any=1
+
+        # Read line by line. IFS= and -r preserve whitespace and backslashes.
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            # strip leading/trailing whitespace
+            _line="${_line#"${_line%%[![:space:]]*}"}"
+            _line="${_line%"${_line##*[![:space:]]}"}"
+
+            # skip blanks and comments
+            [ -z "$_line" ] && continue
+            case "$_line" in \#*) continue ;; esac
+
+            # tolerate an optional leading `export `
+            case "$_line" in
+                export\ *) _line="${_line#export }" ;;
+            esac
+
+            # must contain an '='
+            case "$_line" in
+                *=*) ;;
+                *) continue ;;
+            esac
+
+            _key="${_line%%=*}"
+            _val="${_line#*=}"
+
+            # trim whitespace around key
+            _key="${_key#"${_key%%[![:space:]]*}"}"
+            _key="${_key%"${_key##*[![:space:]]}"}"
+
+            # skip invalid identifiers
+            case "$_key" in
+                ''|*[!A-Za-z0-9_]*) continue ;;
+                [0-9]*) continue ;;
+            esac
+
+            # strip one layer of matching surrounding quotes from the value
+            case "$_val" in
+                \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;;
+                \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;;
+            esac
+
+            export "$_key=$_val"
+
+            # record the key for later cleanup (newline-separated, deduped)
+            case "
+$_new_keys
+" in
+                *"
+$_key
+"*) ;;
+                *) _new_keys="$_new_keys
+$_key" ;;
+            esac
+        done < "$_file"
+    done
+
+    if [ "$_loaded_any" -eq 0 ]; then
+        printf 'envflo: no .env files found for environment "%s" in %s\n' \
+            "$_envflo_env" "$_base_dir" >&2
+        return 1
+    fi
+
+    # strip leading newline, store the tracking list newline-separated
+    _new_keys="${_new_keys#
+}"
+    export ENVFLO_KEYS="$_new_keys"
+    export ENVFLO_ENV="$_envflo_env"
+
+    # show a space-separated summary for readability
+    printf 'envflo: loaded "%s" (%s)\n' \
+        "$_envflo_env" "$(printf '%s' "$_new_keys" | tr '\n' ' ')" >&2
+    return 0
+}
+
+# When this file is sourced (e.g. `source envflo beta`), run the function with
+# whatever args were passed and propagate its exit status to the caller.
+envflo "$@"
